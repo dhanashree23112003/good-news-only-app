@@ -1,0 +1,16 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# HuggingFace / ML cache
+.cache/
+huggingface/
+*.safetensors
+
+# Environment files
+.env
+
+# OS files
+Thumbs.db
+.DS_Store
