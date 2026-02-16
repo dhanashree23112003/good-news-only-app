@@ -253,12 +253,10 @@ def filter_positive(articles: list[dict], threshold: float = POSITIVE_THRESHOLD)
     positive_articles = []
 
     for raw in articles:
-        # Build the text to analyze
         analysis_text = raw["title"]
+
         if raw["summary"]:
             analysis_text += " " + raw["summary"][:200]
-
-        
 
         score = analyze_sentiment(analysis_text)
 
@@ -267,21 +265,18 @@ def filter_positive(articles: list[dict], threshold: float = POSITIVE_THRESHOLD)
         if score >= threshold:
             positive_articles.append(
                 Article(
-                    id             = make_id(raw["url"]),
-                    title          = raw["title"],
-                    summary        = raw["summary"],
-                    url            = raw["url"],
-                    source         = raw["source"],
-                    published      = raw["published"],
-                    positive_score = score,
-                    image_url      = raw.get("image_url"),
+                    id=make_id(raw["url"]),
+                    title=raw["title"],
+                    summary=raw["summary"],
+                    url=raw["url"],
+                    source=raw["source"],
+                    published=raw["published"],
+                    positive_score=score,
+                    image_url=raw.get("image_url"),
                 )
             )
 
-    # Sort by most positive first
     positive_articles.sort(key=lambda a: a.positive_score, reverse=True)
-
-    log.info(f"Kept {len(positive_articles)} positive articles out of {len(articles)}")
     return positive_articles
 
 # ─── API Endpoints ────────────────────────────────────────────────────────────
