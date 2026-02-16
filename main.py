@@ -180,25 +180,29 @@ async def fetch_feed(feed_info: dict) -> list[dict]:
     Fetch and parse one RSS feed asynchronously.
     Returns a list of raw article dicts.
     """
-    url    = feed_info["url"]
+    url = feed_info["url"]
     source = feed_info["source"]
 
     try:
-        # feedparser is sync; run it in a thread executor to stay async
-        loop = asyncio.get_event_loop()
-        parsed = await loop.run_in_executor(None, feedparser.parse, url)
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            content = response.text
+
+        parsed = feedparser.parse(content)
 
         articles = []
-        for entry in parsed.entries[:15]:   # cap per feed to avoid overload
-            title   = clean_text(getattr(entry, "title",   "") or "")
-            summary = clean_text(getattr(entry, "summary", "") or
-                                 getattr(entry, "description", "") or "")
-            link    = getattr(entry, "link", "") or ""
+        for entry in parsed.entries[:15]:
+            title = clean_text(getattr(entry, "title", "") or "")
+            summary = clean_text(
+                getattr(entry, "summary", "") or
+                getattr(entry, "description", "") or ""
+            )
+            link = getattr(entry, "link", "") or ""
 
             if not title or not link:
                 continue
 
-            # Published date — handle various formats
             published = None
             if hasattr(entry, "published"):
                 published = entry.published
@@ -206,10 +210,10 @@ async def fetch_feed(feed_info: dict) -> list[dict]:
                 published = entry.updated
 
             articles.append({
-                "title":     title,
-                "summary":   summary[:400],   # cap summary length
-                "url":       link,
-                "source":    source,
+                "title": title,
+                "summary": summary[:400],
+                "url": link,
+                "source": source,
                 "published": published,
                 "image_url": extract_image(entry),
             })
