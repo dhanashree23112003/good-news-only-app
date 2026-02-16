@@ -18,6 +18,7 @@ Sentiment model used: cardiffnlp/twitter-roberta-base-sentiment-latest
 No paid services. No API keys. Runs 100% locally.
 """
 
+import requests
 import time
 import logging
 import asyncio
@@ -52,12 +53,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Sentiment Model ──────────────────────────────────────────────────────────
-# Loaded once when the server starts. First run downloads ~500MB to ~/.cache/huggingface
-# Subsequent runs use the cached model instantly.
-
-log.info("Loading sentiment model… (first run may take a minute to download)")
-
 sentiment_pipeline = pipeline(
     task="sentiment-analysis",
     model="cardiffnlp/twitter-roberta-base-sentiment-latest",
@@ -67,7 +62,6 @@ sentiment_pipeline = pipeline(
     max_length=128,        # enough for a headline + summary
 )
 
-log.info("Sentiment model loaded ✓")
 
 # ─── RSS Feed Sources ─────────────────────────────────────────────────────────
 # These are free, no-key RSS feeds that tend to have uplifting content.
@@ -165,34 +159,34 @@ def extract_image(entry) -> Optional[str]:
 
     return None
 
+
+
+from gradio_client import Client
+
+client = Client("dhanashree2311/news-sentiment-app")
+
 def analyze_sentiment(text: str) -> float:
-    """
-    Run the text through the sentiment model.
-    Returns a float 0.0–1.0 representing the POSITIVE score.
-
-    The model returns scores for all three labels.
-    We extract the 'positive' label score.
-    """
-    if not text or len(text.strip()) < 10:
-        return 0.0
-
     try:
-        # pipeline returns: [[{label, score}, {label, score}, {label, score}]]
-        results = sentiment_pipeline(text[:512])  # cap at 512 chars
-        scores = {r["label"].lower(): r["score"] for r in results[0]}
-
-        # Model label names vary slightly; handle both formats
-        positive_score = (
-            scores.get("positive") or
-            scores.get("pos") or
-            scores.get("label_2") or   # some model versions use numeric labels
-            0.0
+        result = client.predict(
+            text[:512],
+            api_name="/predict"
         )
-        return round(positive_score, 4)
+
+        if "Positive" in result:
+            confidence = float(
+                result.split("Confidence:")[1]
+                .replace(")", "")
+                .strip()
+            )
+            return confidence
+
+        return 0.0
 
     except Exception as e:
-        log.warning(f"Sentiment error: {e}")
+        log.warning(f"Space error: {e}")
         return 0.0
+
+
 
 async def fetch_feed(feed_info: dict) -> list[dict]:
     """
@@ -263,6 +257,8 @@ def filter_positive(articles: list[dict], threshold: float = POSITIVE_THRESHOLD)
         analysis_text = raw["title"]
         if raw["summary"]:
             analysis_text += " " + raw["summary"][:200]
+
+        
 
         score = analyze_sentiment(analysis_text)
 
@@ -356,7 +352,7 @@ async def get_stats():
 def health():
     return {
         "status":  "healthy",
-        "model":   "cardiffnlp/twitter-roberta-base-sentiment-latest",
+        "model": "dhanashree2311/news-distilroberta-sentiment (via HF Space)",
         "sources": len(RSS_FEEDS),
         "cache_ttl_minutes": CACHE_TTL_SECONDS // 60,
     }

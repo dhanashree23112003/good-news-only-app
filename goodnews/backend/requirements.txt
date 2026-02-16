@@ -1,20 +1,7 @@
-# Good News Only — Python Dependencies
-# Install with: pip install -r requirements.txt
-
-# Web framework
 fastapi==0.115.5
-uvicorn[standard]==0.32.1    # ASGI server to run FastAPI
-
-# RSS feed parsing (no API key needed)
+uvicorn[standard]==0.32.1
 feedparser==6.0.11
-
-# HTTP client (async, used for fetching feeds)
 httpx==0.28.0
-
-# NLP / Sentiment Analysis
-# transformers pulls in PyTorch CPU by default (~700MB first install)
-transformers==4.46.3
-torch>=2.0.0          # installs latest compatible version automatically
-
-# Data validation (used by FastAPI models)
 pydantic==2.10.3
+requests
+gradio_client
