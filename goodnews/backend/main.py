@@ -4,34 +4,33 @@ main.py — Good News Only: FastAPI Backend
 
 Architecture overview:
   1. Fetch articles from free RSS feeds (no API key needed)
-  2. Run each headline + summary through a pretrained sentiment model
+  2. Send headline + summary to a hosted HuggingFace Space
   3. Keep only articles that score as POSITIVE above a threshold
   4. Serve them through a single /api/news endpoint
-  5. Cache results for 15 minutes so we don't hammer the feeds
+  5. Cache results for 15 minutes to reduce repeated processing
 
-Sentiment model used: cardiffnlp/twitter-roberta-base-sentiment-latest
-  - Pretrained on ~58M tweets, very good at tone detection
-  - Three labels: positive / neutral / negative
-  - Runs fully locally via HuggingFace transformers
-  - Loads once at startup (~500MB, cached after first download)
+Sentiment model:
+  - Custom DistilRoBERTa model hosted on HuggingFace Space
+  - Inference handled remotely via gradio_client
+  - Keeps backend lightweight for Render free tier
 
-No paid services. No API keys. Runs 100% locally.
+No paid services. No API keys.
 """
 
-import requests
+
 import time
 import logging
 import asyncio
 import hashlib
-from datetime import datetime
 from typing import Optional
 
 import feedparser
-import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from gradio_client import Client
+
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -51,16 +50,6 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
-
-sentiment_pipeline = pipeline(
-    task="sentiment-analysis",
-    model="cardiffnlp/twitter-roberta-base-sentiment-latest",
-    # Use top_k=None to get scores for all three labels (pos/neu/neg)
-    top_k=None,
-    truncation=True,
-    max_length=128,        # enough for a headline + summary
-)
-
 
 # ─── RSS Feed Sources ─────────────────────────────────────────────────────────
 # These are free, no-key RSS feeds that tend to have uplifting content.
@@ -160,8 +149,6 @@ def extract_image(entry) -> Optional[str]:
 
 
 
-from gradio_client import Client
-
 client = Client("dhanashree2311/news-sentiment-app")
 
 def analyze_sentiment(text: str) -> float:
@@ -242,6 +229,20 @@ async def fetch_all_feeds() -> list[dict]:
     log.info(f"Total articles fetched: {len(all_articles)}")
     return all_articles
 
+async def background_refresh():
+    while True:
+        try:
+            log.info("Running background refresh...")
+            raw = await fetch_all_feeds()
+            positive = filter_positive(raw, threshold=POSITIVE_THRESHOLD)
+            cache_set(f"news_{POSITIVE_THRESHOLD}", [a.model_dump() for a in positive])
+            log.info("Background refresh complete.")
+        except Exception as e:
+            log.error(f"Background refresh failed: {e}")
+
+        await asyncio.sleep(CACHE_TTL_SECONDS)
+
+
 def filter_positive(articles: list[dict], threshold: float = POSITIVE_THRESHOLD) -> list[Article]:
     """
     Run sentiment analysis on each article and keep only positive ones.
@@ -284,6 +285,10 @@ def filter_positive(articles: list[dict], threshold: float = POSITIVE_THRESHOLD)
     return positive_articles
 
 # ─── API Endpoints ────────────────────────────────────────────────────────────
+@app.on_event("startup")
+async def start_background_task():
+    asyncio.create_task(background_refresh())
+
 
 @app.get("/")
 def root():
@@ -355,3 +360,4 @@ def health():
         "sources": len(RSS_FEEDS),
         "cache_ttl_minutes": CACHE_TTL_SECONDS // 60,
     }
+
