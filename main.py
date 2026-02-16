@@ -17,7 +17,8 @@ Sentiment model used: cardiffnlp/twitter-roberta-base-sentiment-latest
 
 No paid services. No API keys. Runs 100% locally.
 """
-
+import feedparser
+import httpx
 import time
 import logging
 import asyncio
@@ -176,20 +177,12 @@ def analyze_sentiment(text: str) -> float:
 
 
 async def fetch_feed(feed_info: dict) -> list[dict]:
-    """
-    Fetch and parse one RSS feed asynchronously.
-    Returns a list of raw article dicts.
-    """
     url = feed_info["url"]
     source = feed_info["source"]
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            content = response.text
-
-        parsed = feedparser.parse(content)
+        loop = asyncio.get_event_loop()
+        parsed = await loop.run_in_executor(None, feedparser.parse, url)
 
         articles = []
         for entry in parsed.entries[:15]:
@@ -203,11 +196,7 @@ async def fetch_feed(feed_info: dict) -> list[dict]:
             if not title or not link:
                 continue
 
-            published = None
-            if hasattr(entry, "published"):
-                published = entry.published
-            elif hasattr(entry, "updated"):
-                published = entry.updated
+            published = getattr(entry, "published", None) or getattr(entry, "updated", None)
 
             articles.append({
                 "title": title,
@@ -224,6 +213,7 @@ async def fetch_feed(feed_info: dict) -> list[dict]:
     except Exception as e:
         log.error(f"Failed to fetch {source}: {e}")
         return []
+
 
 async def fetch_all_feeds() -> list[dict]:
     """Fetch all RSS feeds concurrently."""
