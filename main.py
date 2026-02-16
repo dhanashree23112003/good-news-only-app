@@ -18,7 +18,6 @@ Sentiment model used: cardiffnlp/twitter-roberta-base-sentiment-latest
 No paid services. No API keys. Runs 100% locally.
 """
 
-import requests
 import time
 import logging
 import asyncio
@@ -26,8 +25,6 @@ import hashlib
 from datetime import datetime
 from typing import Optional
 
-import feedparser
-import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -50,15 +47,6 @@ app.add_middleware(
     allow_origins=["*"],       # tighten this in production
     allow_methods=["GET"],
     allow_headers=["*"],
-)
-
-sentiment_pipeline = pipeline(
-    task="sentiment-analysis",
-    model="cardiffnlp/twitter-roberta-base-sentiment-latest",
-    # Use top_k=None to get scores for all three labels (pos/neu/neg)
-    top_k=None,
-    truncation=True,
-    max_length=128,        # enough for a headline + summary
 )
 
 
