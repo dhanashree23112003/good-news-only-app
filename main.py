@@ -1,107 +1,84 @@
 """
-main.py — Good News Only: FastAPI Backend
-==========================================
+main.py — Good News Only: FastAPI Backend (OPTIMIZED v3)
+=========================================================
 
-Architecture overview:
-  1. Fetch articles from free RSS feeds (no API key needed)
-  2. Run each headline + summary through a pretrained sentiment model
-  3. Keep only articles that score as POSITIVE above a threshold
-  4. Serve them through a single /api/news endpoint
-  5. Cache results for 15 minutes so we don't hammer the feeds
+Key performance improvements:
+  1. VADER sentiment — ultra-lightweight, ~2MB, no model download, <1s for 100 articles
+  2. Background scheduler fetches & analyzes every 20 mins — users never wait
+  3. Feeds fetched in parallel (ThreadPoolExecutor)
+  4. Only NEW articles are analyzed (incremental fetch via seen URLs set)
+  5. /api/news reads from pre-built store → responds in <50ms
+  6. App starts immediately; background job runs once at startup silently
 
-Sentiment model used: cardiffnlp/twitter-roberta-base-sentiment-latest
-  - Pretrained on ~58M tweets, very good at tone detection
-  - Three labels: positive / neutral / negative
-  - Runs fully locally via HuggingFace transformers
-  - Loads once at startup (~500MB, cached after first download)
-
-No paid services. No API keys. Runs 100% locally.
+No transformers. No Gradio. No API keys. Runs 100% locally.
 """
+
 import feedparser
-import httpx
 import time
 import logging
-import asyncio
 import hashlib
-from datetime import datetime
+import re
+import threading
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from apscheduler.schedulers.background import BackgroundScheduler
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    force=True
+)
 log = logging.getLogger(__name__)
+
+# ─── VADER — loads instantly, ~2MB, no GPU needed ────────────────────────────
+vader = SentimentIntensityAnalyzer()
+log.info("✅ VADER sentiment analyzer loaded")
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Good News Only API",
     description="Returns only positive and uplifting news articles.",
-    version="1.0.0",
+    version="3.0.0",
 )
 
-# Allow the frontend (any origin in dev) to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # tighten this in production
+    allow_origins=["*"],
     allow_methods=["GET"],
     allow_headers=["*"],
 )
 
-
 # ─── RSS Feed Sources ─────────────────────────────────────────────────────────
-# These are free, no-key RSS feeds that tend to have uplifting content.
-# We cast a wide net and let sentiment filtering do the real work.
-
 RSS_FEEDS = [
-    # Dedicated good news sources
     {"url": "https://www.goodnewsnetwork.org/feed/",        "source": "Good News Network"},
     {"url": "https://www.positive.news/feed/",              "source": "Positive News"},
     {"url": "https://feeds.npr.org/1001/rss.xml",           "source": "NPR News"},
-
-    # Science & tech often has uplifting breakthroughs
     {"url": "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml", "source": "BBC Science"},
     {"url": "https://rss.sciencedaily.com/top/science.xml", "source": "Science Daily"},
-
-    # Health & wellness
     {"url": "https://feeds.bbci.co.uk/news/health/rss.xml", "source": "BBC Health"},
-
-    # Tech innovation
     {"url": "https://techcrunch.com/feed/",                 "source": "TechCrunch"},
-
-    # World good news
     {"url": "https://feeds.bbci.co.uk/news/world/rss.xml",  "source": "BBC World"},
 ]
 
 # ─── Config ───────────────────────────────────────────────────────────────────
+POSITIVE_THRESHOLD = 0.55      # 0.0–1.0 (VADER compound -1→+1 normalized to 0→1)
+MAX_ARTICLES       = 30
+REFRESH_INTERVAL   = 20        # minutes between background fetches
+MAX_PARALLEL_FEEDS = 8         # fetch all feeds simultaneously
 
-# Minimum positive sentiment score to include an article (0.0 – 1.0)
-# 0.55 is a good balance: catches most uplifting content, filters most negativity
-POSITIVE_THRESHOLD = 0.55
-
-# How long to cache results (seconds). Avoids re-fetching on every page load.
-CACHE_TTL_SECONDS = 15 * 60   # 15 minutes
-
-# Max articles to return per request
-MAX_ARTICLES = 30
-
-# ─── Simple In-Memory Cache ───────────────────────────────────────────────────
-
-_cache: dict = {}   # key → {"data": [...], "expires": float}
-
-def cache_get(key: str):
-    entry = _cache.get(key)
-    if entry and entry["expires"] > time.time():
-        return entry["data"]
-    return None
-
-def cache_set(key: str, data, ttl: int = CACHE_TTL_SECONDS):
-    _cache[key] = {"data": data, "expires": time.time() + ttl}
+# ─── Global Store ─────────────────────────────────────────────────────────────
+_article_store: list[dict] = []
+_store_built_at: Optional[float] = None
+_seen_urls: set[str] = set()
 
 # ─── Data Models ──────────────────────────────────────────────────────────────
-
 class Article(BaseModel):
     id: str
     title: str
@@ -111,159 +88,135 @@ class Article(BaseModel):
     published: Optional[str]
     positive_score: float
     image_url: Optional[str] = None
-    category: Optional[str] = None
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-
 def make_id(url: str) -> str:
-    """Stable short ID from the article URL."""
     return hashlib.md5(url.encode()).hexdigest()[:10]
 
 def clean_text(text: str) -> str:
-    """Strip HTML tags and extra whitespace for cleaner sentiment analysis."""
-    import re
     text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"&\w+;", " ", text)   # HTML entities
+    text = re.sub(r"&\w+;", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 def extract_image(entry) -> Optional[str]:
-    """Try to extract a thumbnail image URL from a feed entry."""
-    # Method 1: media:thumbnail
     if hasattr(entry, "media_thumbnail") and entry.media_thumbnail:
         return entry.media_thumbnail[0].get("url")
-
-    # Method 2: media:content
     if hasattr(entry, "media_content") and entry.media_content:
         for media in entry.media_content:
             if media.get("type", "").startswith("image"):
                 return media.get("url")
-
-    # Method 3: enclosures (podcast/image feeds)
     if hasattr(entry, "enclosures") and entry.enclosures:
         for enc in entry.enclosures:
             if enc.get("type", "").startswith("image"):
                 return enc.get("href") or enc.get("url")
-
     return None
 
-
-
-from gradio_client import Client
-
-client = Client("dhanashree2311/news-sentiment-app")
-
+# ─── Sentiment (VADER — instant, no network, no GPU) ─────────────────────────
 def analyze_sentiment(text: str) -> float:
+    """
+    VADER runs locally in microseconds.
+    compound: -1 (most negative) → +1 (most positive)
+    normalized to 0→1 to match threshold logic.
+    """
+    scores = vader.polarity_scores(text[:512])
+    return (scores["compound"] + 1) / 2
+
+# ─── Feed Fetching ────────────────────────────────────────────────────────────
+def fetch_feed_sync(feed_info: dict) -> list[dict]:
+    url, source = feed_info["url"], feed_info["source"]
     try:
-        result = client.predict(
-            text[:512],
-            api_name="/predict"
-        )
-
-        if "Positive" in result:
-            confidence = float(
-                result.split("Confidence:")[1]
-                .replace(")", "")
-                .strip()
-            )
-            return confidence
-
-        return 0.0
-
-    except Exception as e:
-        log.warning(f"Space error: {e}")
-        return 0.0
-
-
-
-async def fetch_feed(feed_info: dict) -> list[dict]:
-    url = feed_info["url"]
-    source = feed_info["source"]
-
-    try:
-        loop = asyncio.get_event_loop()
-        parsed = await loop.run_in_executor(None, feedparser.parse, url)
-
+        parsed = feedparser.parse(url)
         articles = []
         for entry in parsed.entries[:15]:
-            title = clean_text(getattr(entry, "title", "") or "")
-            summary = clean_text(
-                getattr(entry, "summary", "") or
-                getattr(entry, "description", "") or ""
-            )
-            link = getattr(entry, "link", "") or ""
-
+            title   = clean_text(getattr(entry, "title", "") or "")
+            summary = clean_text(getattr(entry, "summary", "") or getattr(entry, "description", "") or "")
+            link    = getattr(entry, "link", "") or ""
             if not title or not link:
                 continue
-
-            published = getattr(entry, "published", None) or getattr(entry, "updated", None)
-
             articles.append({
-                "title": title,
-                "summary": summary[:400],
-                "url": link,
-                "source": source,
-                "published": published,
+                "title":     title,
+                "summary":   summary[:400],
+                "url":       link,
+                "source":    source,
+                "published": getattr(entry, "published", None) or getattr(entry, "updated", None),
                 "image_url": extract_image(entry),
             })
-
         log.info(f"Fetched {len(articles)} articles from {source}")
         return articles
-
     except Exception as e:
         log.error(f"Failed to fetch {source}: {e}")
         return []
 
-
-async def fetch_all_feeds() -> list[dict]:
-    """Fetch all RSS feeds concurrently."""
-    tasks = [fetch_feed(feed) for feed in RSS_FEEDS]
-    results = await asyncio.gather(*tasks)
-    # Flatten list of lists
-    all_articles = [article for feed_articles in results for article in feed_articles]
-    log.info(f"Total articles fetched: {len(all_articles)}")
-    return all_articles
-
-def filter_positive(articles: list[dict], threshold: float = POSITIVE_THRESHOLD) -> list[Article]:
+# ─── Background Job ───────────────────────────────────────────────────────────
+def background_refresh():
     """
-    Run sentiment analysis on each article and keep only positive ones.
-
-    We analyze: title + first 200 chars of summary
-    Rationale: The headline captures tone most clearly. Summary adds context.
+    Runs every REFRESH_INTERVAL minutes.
+    Fetches all feeds → skips seen URLs → runs VADER (instant) → updates store.
+    Users are NEVER blocked by this.
     """
-    positive_articles = []
+    global _article_store, _store_built_at, _seen_urls
 
-    for raw in articles:
-        # Build the text to analyze
-        analysis_text = raw["title"]
-        if raw["summary"]:
-            analysis_text += " " + raw["summary"][:200]
+    try:
+        log.info("🔄 Background job started...")
+        start = time.time()
 
-        
+        # 1. Fetch all feeds in parallel
+        all_raw = []
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_FEEDS) as executor:
+            futures = [executor.submit(fetch_feed_sync, feed) for feed in RSS_FEEDS]
+            for f in as_completed(futures):
+                all_raw.extend(f.result())
 
-        score = analyze_sentiment(analysis_text)
+        log.info(f"Total fetched: {len(all_raw)} articles")
 
-        log.debug(f"[{score:.2f}] {raw['title'][:60]}")
+        # 2. Only process NEW articles (incremental)
+        new_articles = [a for a in all_raw if a["url"] not in _seen_urls]
+        log.info(f"New articles: {len(new_articles)} | Already seen: {len(all_raw) - len(new_articles)}")
 
-        if score >= threshold:
-            positive_articles.append(
-                Article(
-                    id             = make_id(raw["url"]),
-                    title          = raw["title"],
-                    summary        = raw["summary"],
-                    url            = raw["url"],
-                    source         = raw["source"],
-                    published      = raw["published"],
-                    positive_score = score,
-                    image_url      = raw.get("image_url"),
-                )
-            )
+        if not new_articles:
+            log.info("No new articles. Store unchanged.")
+            return
 
-    # Sort by most positive first
-    positive_articles.sort(key=lambda a: a.positive_score, reverse=True)
+        # 3. VADER sentiment — runs locally, <1 second for all articles
+        new_positive = []
+        for article in new_articles:
+            text  = article["title"] + " " + article["summary"][:200]
+            score = analyze_sentiment(text)
+            _seen_urls.add(article["url"])
 
-    log.info(f"Kept {len(positive_articles)} positive articles out of {len(articles)}")
-    return positive_articles
+            if score >= POSITIVE_THRESHOLD:
+                new_positive.append({
+                    "id":             make_id(article["url"]),
+                    "title":          article["title"],
+                    "summary":        article["summary"],
+                    "url":            article["url"],
+                    "source":         article["source"],
+                    "published":      article["published"],
+                    "positive_score": round(score, 3),
+                    "image_url":      article.get("image_url"),
+                })
+
+        # 4. Merge, sort by score, cap at 100
+        combined = _article_store + new_positive
+        combined.sort(key=lambda a: a["positive_score"], reverse=True)
+        _article_store  = combined[:100]
+        _store_built_at = time.time()
+
+        elapsed = time.time() - start
+        log.info(f"✅ Done in {elapsed:.1f}s | {len(new_positive)} new positive | store total: {len(_article_store)}")
+
+    except Exception as e:
+        log.error(f"❌ Background job crashed: {e}", exc_info=True)
+
+# ─── Scheduler ────────────────────────────────────────────────────────────────
+scheduler = BackgroundScheduler()
+scheduler.add_job(background_refresh, "interval", minutes=REFRESH_INTERVAL, id="news_refresh")
+scheduler.start()
+
+# Run once immediately at startup (in background thread so app starts instantly)
+threading.Thread(target=background_refresh, daemon=True).start()
+log.info(f"🚀 App ready. Background job runs every {REFRESH_INTERVAL} mins.")
 
 # ─── API Endpoints ────────────────────────────────────────────────────────────
 
@@ -271,69 +224,57 @@ def filter_positive(articles: list[dict], threshold: float = POSITIVE_THRESHOLD)
 def root():
     return {"status": "ok", "message": "Good News Only API is running 🌟"}
 
+
 @app.get("/api/news", response_model=list[Article])
-async def get_news(
-    limit:     int   = Query(default=20,   ge=1,   le=MAX_ARTICLES, description="Max articles to return"),
-    threshold: float = Query(default=0.55, ge=0.0, le=1.0,          description="Minimum positive score"),
-    refresh:   bool  = Query(default=False,                          description="Bypass cache and re-fetch"),
+def get_news(
+    limit:     int   = Query(default=20,   ge=1,   le=MAX_ARTICLES),
+    threshold: float = Query(default=0.55, ge=0.0, le=1.0),
+    refresh:   bool  = Query(default=False),
 ):
     """
-    Returns a list of positive news articles, filtered by sentiment.
-
-    - Results are cached for 15 minutes
-    - Set ?refresh=true to force a fresh fetch
-    - Adjust ?threshold=0.7 for stricter positivity filtering
+    ⚡ Returns pre-analyzed positive articles from the in-memory store.
+    Responds in <50ms. Background job keeps the store fresh every 20 mins.
     """
-    cache_key = f"news_{threshold}"
+    if refresh:
+        threading.Thread(target=background_refresh, daemon=True).start()
+        log.info("Manual refresh triggered via ?refresh=true")
 
-    # Return cached data if available and not forcing refresh
-    if not refresh:
-        cached = cache_get(cache_key)
-        if cached:
-            log.info(f"Returning {min(limit, len(cached))} cached articles")
-            return cached[:limit]
-
-    # Fetch fresh data
-    log.info("Fetching fresh news from RSS feeds…")
-    raw_articles = await fetch_all_feeds()
-
-    if not raw_articles:
+    if not _article_store:
         return JSONResponse(
             status_code=503,
-            content={"error": "Could not fetch any news feeds. Check your internet connection."}
+            content={"error": "News is still loading. Please try again in 10 seconds."}
         )
 
-    # Filter for positivity
-    positive = filter_positive(raw_articles, threshold=threshold)
-
-    # Cache the full result set
-    cache_set(cache_key, [a.model_dump() for a in positive])
-
-    return positive[:limit]
+    filtered = [a for a in _article_store if a["positive_score"] >= threshold]
+    return filtered[:limit]
 
 
-@app.get("/api/stats")
-async def get_stats():
-    """Returns info about the last fetch: total fetched, how many passed the filter."""
-    # Quick fetch without caching for stats
-    raw = await fetch_all_feeds()
-    positive = filter_positive(raw)
+@app.get("/api/status")
+def get_status():
+    """Check this to confirm the background job is working."""
+    last_updated = None
+    if _store_built_at:
+        secs_ago     = int(time.time() - _store_built_at)
+        last_updated = f"{secs_ago // 60}m {secs_ago % 60}s ago"
 
+    next_run = scheduler.get_job("news_refresh").next_run_time
     return {
-        "total_fetched":    len(raw),
-        "total_positive":   len(positive),
-        "filter_rate":      f"{len(positive)/max(len(raw),1)*100:.1f}%",
-        "sources":          len(RSS_FEEDS),
-        "threshold":        POSITIVE_THRESHOLD,
-        "cached_until":     "15 minutes after last fetch",
+        "articles_in_store":     len(_article_store),
+        "seen_urls_total":       len(_seen_urls),
+        "last_updated":          last_updated or "not yet — still loading",
+        "next_refresh":          str(next_run),
+        "refresh_interval_mins": REFRESH_INTERVAL,
+        "threshold":             POSITIVE_THRESHOLD,
+        "sentiment_engine":      "VADER (local, no API, no GPU)",
     }
 
 
 @app.get("/api/health")
 def health():
     return {
-        "status":  "healthy",
-        "model": "dhanashree2311/news-distilroberta-sentiment (via HF Space)",
-        "sources": len(RSS_FEEDS),
-        "cache_ttl_minutes": CACHE_TTL_SECONDS // 60,
+        "status":                "healthy",
+        "sentiment_engine":      "VADER (vaderSentiment)",
+        "memory_usage":          "~2MB (vs ~500MB for transformers)",
+        "sources":               len(RSS_FEEDS),
+        "refresh_interval_mins": REFRESH_INTERVAL,
     }
